@@ -17,6 +17,9 @@ import org.agrona.concurrent.ManyToOneConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import scala.annotation.tailrec
 import scala.concurrent.Promise
+import scala.util.Try
+import scala.util.Success
+import scala.util.Failure
 
 /**
  * INTERNAL API
@@ -46,7 +49,6 @@ private[remote] final class SendQueue[T] extends GraphStageWithMaterializedValue
 
   override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, QueueValue[T]) = {
     @volatile var needWakeup = false
-    @volatile var producerQueue: Queue[T] = null
     val queuePromise = Promise[Queue[T]]()
 
     val logic = new GraphStageLogic(shape) with OutHandler with WakeupSignal {
@@ -61,11 +63,14 @@ private[remote] final class SendQueue[T] extends GraphStageWithMaterializedValue
 
       override def preStart(): Unit = {
         implicit val ec = materializer.executionContext
-        queuePromise.future.foreach(getAsyncCallback[Queue[T]] { q ⇒
-          consumerQueue = q
-          needWakeup = true
-          if (isAvailable(out))
-            tryPush()
+        queuePromise.future.onComplete(getAsyncCallback[Try[Queue[T]]] {
+          case Success(q) ⇒
+            consumerQueue = q
+            needWakeup = true
+            if (isAvailable(out))
+              tryPush()
+          case Failure(e) ⇒
+            failStage(e)
         }.invoke)
       }
 
@@ -103,6 +108,8 @@ private[remote] final class SendQueue[T] extends GraphStageWithMaterializedValue
     }
 
     val queueValue = new QueueValue[T] {
+      @volatile private var producerQueue: Queue[T] = null
+
       override def inject(q: Queue[T]): Unit = {
         producerQueue = q
         queuePromise.success(q)
